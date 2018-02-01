@@ -10,7 +10,7 @@ import tensorflow as tf
 from edward.models import Bernoulli, Normal
 from progressbar import ETA, Bar, Percentage, ProgressBar
 
-from datasets import IHDP
+from datasets import IHDP, SYNData
 from evaluation import Evaluator
 import numpy as np
 import time
@@ -22,24 +22,28 @@ from argparse import ArgumentParser
 parser = ArgumentParser()
 parser.add_argument('-reps', type=int, default=10)
 parser.add_argument('-earl', type=int, default=10)
-parser.add_argument('-lr', type=float, default=0.001)
+parser.add_argument('-lr', type=float, default=0.0001)
 parser.add_argument('-opt', choices=['adam', 'adamax'], default='adam')
-parser.add_argument('-epochs', type=int, default=100)
+parser.add_argument('-epochs', type=int, default=50)
 parser.add_argument('-print_every', type=int, default=10)
 args = parser.parse_args()
 
 args.true_post = True
 
 
-dataset = IHDP(replications=args.reps)
-dimx = 25
+dataset = SYNData(replications=args.reps)
+# dimx = 25
+dimx = 1
 scores = np.zeros((args.reps, 3))
 scores_test = np.zeros((args.reps, 3))
 
 M = None  # batch size during training
 d = 20  # latent dimension
+d = 1
+
 lamba = 1e-4  # weight decay
-nh, h = 3, 200  # number and size of hidden layers
+# nh, h = 3, 200  # number and size of hidden layers
+nh, h = 2, 3  # number and size of hidden layers
 
 for i, (train, valid, test, contfeats, binfeats) in enumerate(dataset.get_train_valid_test()):
     print '\nReplication {}/{}'.format(i + 1, args.reps)
@@ -59,6 +63,7 @@ for i, (train, valid, test, contfeats, binfeats) in enumerate(dataset.get_train_
     # zero mean, unit variance for y during training
     ym, ys = np.mean(ytr), np.std(ytr)
     ytr, yva = (ytr - ym) / ys, (yva - ym) / ys
+
     best_logpvalid = - np.inf
 
     with tf.Graph().as_default():
@@ -156,7 +161,7 @@ for i, (train, valid, test, contfeats, binfeats) in enumerate(dataset.get_train_
 
             t0 = time.time()
             widgets = ["epoch #%d|" % epoch, Percentage(), Bar(), ETA()]
-            pbar = ProgressBar(n_iter_per_epoch, widgets=widgets)
+            pbar = ProgressBar(max_value=n_iter_per_epoch, widgets=widgets)
             pbar.start()
             np.random.shuffle(idx)
             for j in range(n_iter_per_epoch):
