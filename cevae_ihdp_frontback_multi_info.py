@@ -7,12 +7,10 @@ from __future__ import division
 import edward as ed
 import tensorflow as tf
 
-import pickle
-
 from edward.models import Bernoulli, Normal
 from progressbar import ETA, Bar, Percentage, ProgressBar
 
-from datasets import IHDP, SYNData, SYNDataFrontBack, SYNDataBack
+from datasets import IHDP, SYNData, SYNDataFrontBack
 from evaluation import Evaluator
 import numpy as np
 import time
@@ -25,35 +23,35 @@ from argparse import ArgumentParser
 
 
 
-def iteration(reps=10,noise=1):
+
+
+
+def iteration(noise1=1,noise2=1):
     parser = ArgumentParser()
-    parser.add_argument('-reps', type=int, default=10)
+    parser.add_argument('-reps', type=int, default=30)
     parser.add_argument('-earl', type=int, default=10)
-    parser.add_argument('-lr', type=float, default=0.0005)
+    parser.add_argument('-lr', type=float, default=0.0001)
     parser.add_argument('-opt', choices=['adam', 'adamax'], default='adam')
-    parser.add_argument('-epochs', type=int, default=50)
+    parser.add_argument('-epochs', type=int, default=60)
     parser.add_argument('-print_every', type=int, default=10)
+
     args = parser.parse_args()
-    # args.lr = np.random.uniform(0.0005,0.005)
-    # print(args.lr)
+
     args.true_post = True
-    args.reps = reps
 
-    dataset = SYNDataBack(replications=args.reps,noiseX=noise)
-    # dataset = IHDP(replications=args.reps)
-    # dataset = SYNDataMulti(replications=args.reps)
-
+    dataset = SYNDataFrontBack(replications=args.reps,noiseX1=noise1,noiseX2=noise2)
     # dimx = 25
     dimx = 1
     scores = np.zeros((args.reps, 3))
     scores_test = np.zeros((args.reps, 3))
 
     M = None  # batch size during training
-    d = 2  # latent dimension
-    d = 25
+    d = 20  # latent dimension
+    d = 1
+
     lamba = 1e-4  # weight decay
-    nh, h = 3, 200  # number and size of hidden layers
-    # nh, h = 2,1000  # number and size of hidden layers
+    # nh, h = 3, 200  # number and size of hidden layers
+    nh, h = 3, 4  # number and size of hidden layers
 
     for i, (train, valid, test, contfeats, binfeats) in enumerate(dataset.get_train_valid_test()):
         print '\nReplication {}/{}'.format(i + 1, args.reps)
@@ -64,7 +62,7 @@ def iteration(reps=10,noise=1):
 
         # reorder features with binary first and continuous after
         perm = binfeats + contfeats
-        xtr, xva, xte = xtr[:, perm], xva[:, perm], xte[:, perm]
+        xtr, xva, xte = xtr[:,:, perm], xva[:,:, perm], xte[:,:, perm]
 
         xalltr, talltr, yalltr = np.concatenate([xtr, xva], axis=0), np.concatenate([ttr, tva], axis=0), np.concatenate([ytr, yva], axis=0)
         evaluator_train = Evaluator(yalltr, talltr, y_cf=np.concatenate([y_cftr, y_cfva], axis=0),
@@ -83,25 +81,31 @@ def iteration(reps=10,noise=1):
             np.random.seed(1)
             tf.set_random_seed(1)
 
-            x_ph_bin = tf.placeholder(tf.float32, [M, len(binfeats)], name='x_bin')  # binary inputs
-            x_ph_cont = tf.placeholder(tf.float32, [M, len(contfeats)], name='x_cont')  # continuous inputs
+            x_ph_bin = tf.placeholder(tf.float32, [M,2, len(binfeats)], name='x_bin')  # binary inputs
+            x_ph_cont = tf.placeholder(tf.float32, [M,2,len(contfeats)], name='x_cont')  # continuous inputs
             t_ph = tf.placeholder(tf.float32, [M, 1])
             y_ph = tf.placeholder(tf.float32, [M, 1])
 
-            x_ph = tf.concat([x_ph_bin, x_ph_cont], 1)
+            x_ph = tf.concat([x_ph_bin, x_ph_cont], 2)
             activation = tf.nn.elu
 
             # CEVAE model (decoder)
             # p(z)
-            z = Normal(loc=tf.zeros([tf.shape(x_ph)[0], d]), scale=tf.ones([tf.shape(x_ph)[0], d]))
+            z = Normal(loc=tf.zeros([tf.shape(x_ph)[0], 2*d]), scale=tf.ones([tf.shape(x_ph)[0], 2*d]))
+
 
             # p(x|z)
             hx = fc_net(z, (nh - 1) * [h], [], 'px_z_shared', lamba=lamba, activation=activation)
-            logits = fc_net(hx, [h], [[len(binfeats), None]], 'px_z_bin'.format(i + 1), lamba=lamba, activation=activation)
-            x1 = Bernoulli(logits=logits, dtype=tf.float32, name='bernoulli_px_z')
+            logits = fc_net(hx, [h], [[2*len(binfeats), None]], 'px_z_bin'.format(i + 1), lamba=lamba, activation=activation)
+            x1 = Bernoulli(logits=tf.expand_dims(logits,-1), dtype=tf.float32, name='bernoulli_px_z')
 
             mu, sigma = fc_net(hx, [h], [[len(contfeats), None], [len(contfeats), tf.nn.softplus]], 'px_z_cont', lamba=lamba,
                                activation=activation)
+            mu = tf.expand_dims(mu,dim=1)
+            mu = tf.concat((mu,mu),axis=1)
+            sigma = tf.expand_dims(sigma,dim=1)
+            sigma = tf.concat((sigma,sigma),axis=1)
+
             x2 = Normal(loc=mu, scale=sigma, name='gaussian_px_z')
 
             # p(t|z)
@@ -113,26 +117,49 @@ def iteration(reps=10,noise=1):
             mu2_t1 = fc_net(z, nh * [h], [[1, None]], 'py_t1z', lamba=lamba, activation=activation)
             y = Normal(loc=t * mu2_t1 + (1. - t) * mu2_t0, scale=tf.ones_like(mu2_t0))
 
-            # CEVAE variational approximation (encoder)
+            # CEVAE variational approximation (encoder) Before
             # q(t|x)
-            logits_t = fc_net(x_ph, [d], [[1, None]], 'qt', lamba=lamba, activation=activation)
-            qt = Bernoulli(logits=logits_t, dtype=tf.float32)
+            x_ph_before = x_ph[:,0]
+            x_ph_after = x_ph[:,1]
+            logits_t_before = fc_net(x_ph_before, [d], [[1, None]], 'qt_before', lamba=lamba, activation=activation)
+            qt_before = Bernoulli(logits=logits_t_before, dtype=tf.float32)
             # q(y|x,t)
-            hqy = fc_net(x_ph, (nh - 1) * [h], [], 'qy_xt_shared', lamba=lamba, activation=activation)
-            mu_qy_t0 = fc_net(hqy, [h], [[1, None]], 'qy_xt0', lamba=lamba, activation=activation)
-            mu_qy_t1 = fc_net(hqy, [h], [[1, None]], 'qy_xt1', lamba=lamba, activation=activation)
-            qy = Normal(loc=qt * mu_qy_t1 + (1. - qt) * mu_qy_t0, scale=tf.ones_like(mu_qy_t0))
+            hqy_before = fc_net(x_ph_before, (nh - 1) * [h], [], 'qy_xt_shared_before', lamba=lamba, activation=activation)
+            mu_qy_t0_before = fc_net(hqy_before, [h], [[1, None]], 'qy_xt0_before', lamba=lamba, activation=activation)
+            mu_qy_t1_before = fc_net(hqy_before, [h], [[1, None]], 'qy_xt1_before', lamba=lamba, activation=activation)
+            qy_before = Normal(loc=qt_before * mu_qy_t1_before + (1. - qt_before) * mu_qy_t0_before, scale=tf.ones_like(mu_qy_t0_before))
             # q(z|x,t,y)
-            inpt2 = tf.concat([x_ph, qy], 1)
-            hqz = fc_net(inpt2, (nh - 1) * [h], [], 'qz_xty_shared', lamba=lamba, activation=activation)
-            muq_t0, sigmaq_t0 = fc_net(hqz, [h], [[d, None], [d, tf.nn.softplus]], 'qz_xt0', lamba=lamba,
+            inpt2_before = tf.concat([x_ph_before, qy_before], 1)
+            hqz_before = fc_net(inpt2_before, (nh - 1) * [h], [], 'qz_xty_shared_before', lamba=lamba, activation=activation)
+            muq_t0_before, sigmaq_t0_before = fc_net(hqz_before, [h], [[d, None], [d, tf.nn.softplus]], 'qz_xt0_before', lamba=lamba,
                                        activation=activation)
-            muq_t1, sigmaq_t1 = fc_net(hqz, [h], [[d, None], [d, tf.nn.softplus]], 'qz_xt1', lamba=lamba,
+            muq_t1_before, sigmaq_t1_before = fc_net(hqz_before, [h], [[d, None], [d, tf.nn.softplus]], 'qz_xt1_before', lamba=lamba,
                                        activation=activation)
-            qz = Normal(loc=qt * muq_t1 + (1. - qt) * muq_t0, scale=qt * sigmaq_t1 + (1. - qt) * sigmaq_t0)
 
+            # CEVAE variational approximation (encoder) After
+            # q(t|x)
+            logits_t_after = fc_net(x_ph_after, [d], [[1, None]], 'qt_after', lamba=lamba, activation=activation)
+            qt_after = Bernoulli(logits=logits_t_after, dtype=tf.float32)
+            # q(y|x,t)
+            hqy_after = fc_net(x_ph_after, (nh - 1) * [h], [], 'qy_xt_shared_after', lamba=lamba, activation=activation)
+            mu_qy_t0_after = fc_net(hqy_after, [h], [[1, None]], 'qy_xt0_after', lamba=lamba, activation=activation)
+            mu_qy_t1_after = fc_net(hqy_after, [h], [[1, None]], 'qy_xt1_after', lamba=lamba, activation=activation)
+            qy_after = Normal(loc=qt_after * mu_qy_t1_after + (1. - qt_after) * mu_qy_t0_after, scale=tf.ones_like(mu_qy_t0_after))
+            # q(z|x,t,y)
+            inpt2_after = tf.concat([x_ph_after, qy_after], 1)
+            hqz_after = fc_net(inpt2_after, (nh - 1) * [h], [], 'qz_xty_shared_after', lamba=lamba, activation=activation)
+            muq_t0_after, sigmaq_t0_after = fc_net(hqz_after, [h], [[d, None], [d, tf.nn.softplus]], 'qz_xt0_after', lamba=lamba,
+                                       activation=activation)
+            muq_t1_after, sigmaq_t1_after = fc_net(hqz_after, [h], [[d, None], [d, tf.nn.softplus]], 'qz_xt1_after', lamba=lamba,
+                                       activation=activation)
+
+            qloc = tf.concat((qt_before * muq_t1_before + (1. - qt_before) * muq_t0_before,
+                              qt_after * muq_t1_after + (1. - qt_after) * muq_t0_after), axis=1)
+            qscale = tf.concat((qt_before * sigmaq_t1_before + (1. - qt_before) * sigmaq_t0_before,
+                               qt_after * sigmaq_t1_after + (1. - qt_after) * sigmaq_t0_after), axis=1)
+            qz = Normal(loc=qloc, scale=qscale)
             # Create data dictionary for edward
-            data = {x1: x_ph_bin, x2: x_ph_cont, y: y_ph, qt: t_ph, t: t_ph, qy: y_ph}
+            data = {x1: x_ph_bin, x2: x_ph_cont, y: y_ph, qt_before: t_ph, qt_after: t_ph, t: t_ph, qy_before: y_ph, qy_after: y_ph}
 
             # sample posterior predictive for p(y|z,t)
             y_post = ed.copy(y, {z: qz, t: t_ph}, scope='y_post')
@@ -140,18 +167,19 @@ def iteration(reps=10,noise=1):
             y_post_mean = ed.copy(y, {z: qz.mean(), t: t_ph}, scope='y_post_mean')
             # construct a deterministic version (i.e. use the mean of the approximate posterior) of the lower bound
             # for early stopping according to a validation set
-            y_post_eval = ed.copy(y, {z: qz.mean(), qt: t_ph, qy: y_ph, t: t_ph}, scope='y_post_eval')
-            x1_post_eval = ed.copy(x1, {z: qz.mean(), qt: t_ph, qy: y_ph}, scope='x1_post_eval')
-            x2_post_eval = ed.copy(x2, {z: qz.mean(), qt: t_ph, qy: y_ph}, scope='x2_post_eval')
-            t_post_eval = ed.copy(t, {z: qz.mean(), qt: t_ph, qy: y_ph}, scope='t_post_eval')
+            y_post_eval = ed.copy(y, {z: qz.mean(), qt_before: t_ph, qy_before: y_ph, qt_after: t_ph, qy_after: y_ph, t: t_ph}, scope='y_post_eval')
+            x1_post_eval = ed.copy(x1, {z: qz.mean(),qt_before: t_ph, qy_before: y_ph, qt_after: t_ph, qy_after: y_ph}, scope='x1_post_eval')
+            x2_post_eval = ed.copy(x2, {z: qz.mean(), qt_before: t_ph, qy_before: y_ph, qt_after: t_ph, qy_after: y_ph,}, scope='x2_post_eval')
+            t_post_eval = ed.copy(t, {z: qz.mean(), qt_before: t_ph, qy_before: y_ph, qt_after: t_ph, qy_after: y_ph,}, scope='t_post_eval')
             logp_valid = tf.reduce_mean(tf.reduce_sum(y_post_eval.log_prob(y_ph) + t_post_eval.log_prob(t_ph), axis=1) +
                                         tf.reduce_sum(x1_post_eval.log_prob(x_ph_bin), axis=1) +
-                                        tf.reduce_sum(x2_post_eval.log_prob(x_ph_cont), axis=1) +
+                                        # tf.reduce_sum(x2_post_eval.log_prob(x_ph_cont), axis=1) +
                                         tf.reduce_sum(z.log_prob(qz.mean()) - qz.log_prob(qz.mean()), axis=1))
 
             inference = ed.KLqp({z: qz}, data)
             optimizer = tf.train.AdamOptimizer(learning_rate=args.lr)
             inference.initialize(optimizer=optimizer)
+
 
             saver = tf.train.Saver(tf.contrib.slim.get_variables())
             tf.global_variables_initializer().run()
@@ -161,10 +189,10 @@ def iteration(reps=10,noise=1):
             # dictionaries needed for evaluation
             tr0, tr1 = np.zeros((xalltr.shape[0], 1)), np.ones((xalltr.shape[0], 1))
             tr0t, tr1t = np.zeros((xte.shape[0], 1)), np.ones((xte.shape[0], 1))
-            f1 = {x_ph_bin: xalltr[:, 0:len(binfeats)], x_ph_cont: xalltr[:, len(binfeats):], t_ph: tr1}
-            f0 = {x_ph_bin: xalltr[:, 0:len(binfeats)], x_ph_cont: xalltr[:, len(binfeats):], t_ph: tr0}
-            f1t = {x_ph_bin: xte[:, 0:len(binfeats)], x_ph_cont: xte[:, len(binfeats):], t_ph: tr1t}
-            f0t = {x_ph_bin: xte[:, 0:len(binfeats)], x_ph_cont: xte[:, len(binfeats):], t_ph: tr0t}
+            f1 = {x_ph_bin: xalltr[:,:, 0:len(binfeats)], x_ph_cont: xalltr[:,:, len(binfeats):], t_ph: tr1}
+            f0 = {x_ph_bin: xalltr[:,:, 0:len(binfeats)], x_ph_cont: xalltr[:,:, len(binfeats):], t_ph: tr0}
+            f1t = {x_ph_bin: xte[:,:, 0:len(binfeats)], x_ph_cont: xte[:,:, len(binfeats):], t_ph: tr1t}
+            f0t = {x_ph_bin: xte[:,:, 0:len(binfeats)], x_ph_cont: xte[:,:, len(binfeats):], t_ph: tr0t}
 
             for epoch in range(n_epoch):
                 avg_loss = 0.0
@@ -174,21 +202,20 @@ def iteration(reps=10,noise=1):
                 pbar = ProgressBar(max_value=n_iter_per_epoch, widgets=widgets)
                 pbar.start()
                 np.random.shuffle(idx)
-                batch_size = 100
                 for j in range(n_iter_per_epoch):
                     pbar.update(j)
-                    batch = np.random.choice(idx, batch_size)
-                    x_train, y_train, t_train = xtr[batch], ytr[batch], ttr[batch]
-                    info_dict = inference.update(feed_dict={x_ph_bin: x_train[:, 0:len(binfeats)],
-                                                            x_ph_cont: x_train[:, len(binfeats):],
+                    batch = np.random.choice(idx, 100)
+                    x_train, y_train, t_train = xtr[batch][:,:], ytr[batch], ttr[batch]
+                    info_dict = inference.update(feed_dict={x_ph_bin: x_train[:,:, 0:len(binfeats)],
+                                                            x_ph_cont: x_train[:,:,len(binfeats):],
                                                             t_ph: t_train, y_ph: y_train})
                     avg_loss += info_dict['loss']
 
                 avg_loss = avg_loss / n_iter_per_epoch
-                avg_loss = avg_loss / batch_size
+                avg_loss = avg_loss / 100
 
                 if epoch % args.earl == 0 or epoch == (n_epoch - 1):
-                    logpvalid = sess.run(logp_valid, feed_dict={x_ph_bin: xva[:, 0:len(binfeats)], x_ph_cont: xva[:, len(binfeats):],
+                    logpvalid = sess.run(logp_valid, feed_dict={x_ph_bin: xva[:,:, 0:len(binfeats)], x_ph_cont: xva[:,:,len(binfeats):],
                                                                 t_ph: tva, y_ph: yva})
                     if logpvalid >= best_logpvalid:
                         print 'Improved validation bound, old: {:0.3f}, new: {:0.3f}'.format(best_logpvalid, logpvalid)
@@ -230,45 +257,45 @@ def iteration(reps=10,noise=1):
 
     print 'CEVAE model total scores'
     means, stds = np.mean(scores, axis=0), sem(scores, axis=0)
-    means_train, stds_train = means, stds
     print 'train ITE: {:.3f}+-{:.3f}, train ATE: {:.3f}+-{:.3f}, train PEHE: {:.3f}+-{:.3f}' \
           ''.format(means[0], stds[0], means[1], stds[1], means[2], stds[2])
 
-
     means, stds = np.mean(scores_test, axis=0), sem(scores_test, axis=0)
-    means_test, stds_test = means, stds
     print 'test ITE: {:.3f}+-{:.3f}, test ATE: {:.3f}+-{:.3f}, test PEHE: {:.3f}+-{:.3f}' \
           ''.format(means[0], stds[0], means[1], stds[1], means[2], stds[2])
 
-    return means_train[1], stds_train[1], means_test[1], stds_test[1]
+    return means[1], stds[1]
 
-# iteration(reps=1,noise=1)
 
-noises = [1,3,5,10,25,50,100]
 
-means_train = np.zeros(len(noises))
-stds_train = np.zeros(means_train.shape)
-means_test = np.zeros(means_train.shape)
-stds_test = np.zeros(means_train.shape)
+noises = np.power(2.0,range(-3,4))
+means = np.zeros(noises.shape)
+stds = np.zeros(noises.shape)
+# for i,noise in enumerate(noises):
+#     means[i], stds[i] = iteration(noise1=noise)
+#
+# plt.errorbar(noises,means,yerr=stds, linestyle='None', fmt='o')
+# plt.xlabel('Noise Coefficient')
+# plt.ylabel('ATE estimation Error')
+# plt.title('ATE error vs. Pre-treatment Noise')
+# plt.savefig('Noise1.png')
+#
+# data = {}
+# data['noise'] = noises
+# data['mean'] = means
+# data['std'] = stds
+# np.save('noise1.npy',data)
+
 for i,noise in enumerate(noises):
-    print('\n\n\n\n\n\n\n---------------------------------------------------------------\nCurrent noise level is: noise = {}\n---------------------------------------------------------------\n\n\n\n\n\n\n'.format(noise))
-    means_train[i], stds_train[i], means_test[i], stds_test[i] = iteration(reps=50,noise=noise)
+    means[i], stds[i] = iteration(noise2=noise)
 
-
-data = {}
-data['noises'] = noises
-data['mean_train'] = means_train
-data['std_train'] = stds_train
-data['mean_test'] = means_test
-data['std_test'] = stds_test
-
-
-with open("simulation_data_only_pre.pickle","wb") as f:
-    pickle.dump(data,f)
-
-
-plt.errorbar(noises,means_test,yerr=stds_test, linestyle='None', fmt='o')
+plt.errorbar(noises,means,yerr=stds, linestyle='None', fmt='o')
 plt.xlabel('Noise Coefficient')
 plt.ylabel('ATE estimation Error')
 plt.title('ATE error vs. Post-treatment Noise')
-plt.savefig('Noise_only_pre.png')
+plt.savefig('Noise2.png')
+data = {}
+data['noise'] = noises
+data['mean'] = means
+data['std'] = stds
+np.save('noise2.npy',data)
